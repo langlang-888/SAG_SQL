@@ -1,0 +1,546 @@
+"""应用配置（pydantic-settings）。
+
+所有配置项均可通过环境变量 `SAG_*` 或 `.env` 覆盖。设计上区分三类后端：
+
+- **sag 元数据库**（用户 / 信源 / 文档 / 会话）：`database_url`
+- **zleap-sag 存储**（分块 / 向量 / 事件图谱）：`sag_*` + `data_dir`
+- **LLM / embedding**（抽取与答案生成）：`llm_*` / `embedding_*`
+- **文档解析**（PDF / Office 等转 Markdown）：`document_parser` / `mineru_*`
+
+默认零依赖：SQLite 元数据 + zleap-sag 本地 LanceDB。生产可整体切到 Postgres。
+"""
+
+from __future__ import annotations
+
+import json
+from functools import lru_cache
+from pathlib import Path
+from typing import Annotated, Literal
+from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from sag_api.core.model_providers import ModelProviderId, get_model_provider
+from sag_api.core.responses import Config as ResponsesConfig
+from sag_api.core.responses import ResponsesProviderId
+from sag_api.enums import SearchStrategy, normalize_search_strategy
+
+_DEFAULT_LLM_PROVIDER = get_model_provider("openai")
+MAX_JEV_RANKING_TIMEOUT_SECONDS = 120.0
+
+# zleap-sag 0.13.0 之前的默认向量维度：未显式配置时用它预建向量 schema，
+# 保持既有知识库的向量空间不变（存量 LanceDB 向量与该维度绑定）。
+_DEFAULT_EMBEDDING_DIMENSIONS = 1024
+
+# 已知拒绝 OpenAI `dimensions` 请求参数的服务商/模型组合。zleap-sag 0.12.0 把
+# schema 维度与请求参数混为同一字段，SAG 曾用「引擎初始化后改写私有属性」绕过；
+# 0.13.0 拆分后可在此直接表达为 request_dimensions 省略。
+_EMBEDDING_REQUEST_DIMENSIONS_UNSUPPORTED = ("api.siliconflow.cn", "baai/bge-m3")
+
+
+def _embedding_request_dimensions_unsupported(base_url: str | None, model: str) -> bool:
+    """该服务商/模型组合是否拒绝请求体里的 `dimensions` 参数。"""
+    hostname = (urlsplit(base_url or "").hostname or "").lower()
+    return (hostname, model.strip().lower()) == _EMBEDDING_REQUEST_DIMENSIONS_UNSUPPORTED
+
+
+def expand_embedding_dimensions(updates: dict) -> dict:
+    """An explicit UI dimension overrides both split fields, including when cleared."""
+    expanded = dict(updates)
+    if "embedding_dimensions" in updates:
+        expanded["embedding_schema_dimensions"] = updates["embedding_dimensions"]
+        expanded["embedding_request_dimensions"] = updates["embedding_dimensions"]
+    return expanded
+
+
+def normalize_jev_endpoint(value: str | None) -> str | None:
+    """Keep the full scoring URL while rejecting credentials and unusable URLs."""
+    if value is None or not value.strip():
+        return None
+    endpoint = value.strip()
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("JEV 服务地址必须是有效的完整 HTTP(S) URL") from None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or any(char.isspace() for char in endpoint)
+        or port == 0
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValueError("JEV 服务地址必须是完整 HTTP(S) URL，不能包含用户凭证或 fragment")
+    return endpoint
+
+
+class Settings(BaseSettings):
+    _active_data_dir: str | None = PrivateAttr(default=None)
+
+    model_config = SettingsConfigDict(
+        env_prefix="SAG_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+        hide_input_in_errors=True,
+    )
+
+    # ── 应用 ────────────────────────────────────────────────────────────
+    app_name: str = "sag"
+    environment: Literal["dev", "prod"] = "dev"
+    debug: bool = True
+    secret_key: str = "dev-insecure-secret-change-me-in-production-0123456789"
+    access_token_expire_minutes: int = 60 * 24 * 7  # 7 天
+    # local 保留单机名字身份；password 强制邮箱密码认证。
+    auth_mode: Literal["local", "password"] = "local"
+    # Complete externally configured bases; never infer the Web port from the API.
+    client_public_url: str | None = None
+    client_web_url: str | None = None
+    # 业务展示时区；数据库与 API 时间戳始终使用 UTC。
+    timezone: str = "Asia/Shanghai"
+    # NoDecode 让逗号分隔值先进入下方 validator，避免 settings 源强制按 JSON 解码。
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:3000"])
+    # 关闭后仅允许首个用户注册（部署引导），其余返回 403
+    allow_registration: bool = True
+    # Dify 外部知识库调用的专用服务密钥；未配置时兼容端点拒绝服务。
+    dify_api_key: str | None = None
+    # 供桌面端启动时写入本地 DSH 连接文件的公开地址与可选文件位置。
+    dsh_public_url: str = "http://127.0.0.1:8000"
+    dsh_connection_file: str | None = None
+    dsh_local_discovery: bool = False
+    dsh_local_discovery_bind_address: str = "127.0.0.1"
+    # Dify 检索默认优先低延迟向量召回；可显式设为 multi 启用实体扩展与 LLM 精排。
+    dify_search_strategy: SearchStrategy = "vector"
+
+    # ── sag 元数据库 ───────────────────────────────────────────────────
+    database_url: str = "sqlite+aiosqlite:///./.data/sag.db"
+
+    # ── 存储 ────────────────────────────────────────────────────────────
+    data_dir: str = "./.data/engine"  # zleap-sag data_dir（LanceDB + SQLite）
+    upload_dir: str = "./.data/uploads"  # 上传原始文件落盘
+    max_upload_mb: int = 25  # 单文件上传上限
+    job_concurrency: int = 2  # 后台处理并发
+    document_extract_concurrency: int = Field(default=30, ge=1, le=50)  # 单文档 chunk 抽取并发
+    document_chunk_max_tokens: int = Field(default=1_000, ge=100, le=100_000)
+    document_chunk_mode: Literal["standard", "heading_strict"] = "standard"
+    document_extraction_profile: Literal["standard", "concise"] = "standard"
+    document_event_entity_attempts: int = Field(default=2, ge=1, le=3)
+    # 上传文档已有独立的知识型过滤要求；默认关闭上游基于标题/摘要的严格过滤，
+    # 避免无摘要或标题缺失的书籍正文被误判为噪音。
+    document_strict_filtering: bool = False
+    job_max_attempts: int = 3  # 可重试失败的最大尝试次数（含首次）
+    engine_cache_size: int = 16  # 引擎槽 LRU 上限（超限逐出最久未用）
+    engine_warmup_count: int = 4  # 启动时预热最近使用的信源引擎数
+    # 允许上传的扩展名白名单（小写，含点）；空集合表示不限制
+    allowed_upload_exts: set[str] = {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".text",
+        ".pdf",
+        ".docx",
+        ".pptx",
+        ".xls",
+        ".xlsx",
+        ".csv",
+        ".tsv",
+        ".html",
+        ".htm",
+        ".json",
+        ".epub",
+    }
+
+    # ── OCTX 信源导入导出 ───────────────────────────────────────────────
+    # 压缩包在一次性受限子进程中校验/打包；这些值是部署可调的硬上限，
+    # 不能只依赖 OCTX SDK 默认值或请求层 Content-Length。
+    octx_max_upload_mb: int = Field(default=2048, ge=1)
+    octx_max_entries: int = Field(default=10_000, ge=1)
+    octx_max_file_mb: int = Field(default=512, ge=1)
+    octx_max_uncompressed_mb: int = Field(default=4096, ge=1)
+    octx_max_compression_ratio: float = Field(default=100, gt=0)
+    octx_max_jsonl_line_mb: int = Field(default=16, ge=1)
+    octx_max_jsonl_records: int = Field(default=1_000_000, ge=1)
+    octx_max_issues: int = Field(default=1000, ge=1)
+    octx_worker_memory_mb: int = Field(default=2048, ge=128)
+    octx_worker_timeout_seconds: int = Field(default=1800, ge=1)
+    octx_transfer_ttl_hours: int = Field(default=24, ge=1)
+    octx_rollback_retention_days: int = Field(default=7, ge=0)
+    # OCTX 向量复用是可关闭的兼容加速层；关闭后沿用现有 Embedding 重建路径。
+    octx_arrow_vector_reuse_enabled: bool = True
+    octx_reused_vector_batch_size: int = Field(default=500, ge=50, le=2000)
+    octx_vector_progress_interval_seconds: float = Field(default=1.0, ge=0.1, le=10.0)
+
+    # ── zleap-sag 后端选择 ─────────────────────────────────────────────
+    # None → 零基础设施（LanceDB + 内置 SQLite，落在 data_dir）
+    sag_vector_provider: Literal["lancedb", "es", "pgvector", "oceanbase"] = "lancedb"
+    sag_relational_provider: Literal["sqlite", "postgres", "mysql", "oceanbase"] | None = None
+    sag_language: Literal["zh", "en"] = "zh"
+    # 所有平台均须显式确认重建。保留 windows_fresh 旧配置值，仅选择原地保留
+    # 引擎目录并备份业务数据库的策略，不表示自动重建或迁移。
+    storage_bootstrap_policy: Literal["prompt", "windows_fresh"] = "prompt"
+
+    # 生产单库（pgvector）时复用同一 Postgres —— 由这些字段拼装
+    sag_pg_host: str = "localhost"
+    sag_pg_port: int = 5432
+    sag_pg_user: str = "sag"
+    sag_pg_password: str = "sag"
+    sag_pg_database: str = "sag"
+
+    # ── LLM（答案生成 + 抽取）─────────────────────────────────────────
+    # 协议、路由规则和技术默认值统一由 model_providers 注册表维护。
+    llm_provider: ModelProviderId = _DEFAULT_LLM_PROVIDER.id
+    llm_base_url: str | None = _DEFAULT_LLM_PROVIDER.default_base_url
+    llm_api_key: str | None = None
+    # Keep the implicit runtime default stable for existing env-only deployments.
+    # New setup forms and provider presets explicitly save the current model.
+    llm_model: str = "qwen3.6-flash"
+    llm_temperature: float = _DEFAULT_LLM_PROVIDER.default_temperature
+    llm_max_tokens: int = 20_000
+    llm_context_window: int = _DEFAULT_LLM_PROVIDER.default_context_window
+    llm_timeout_ms: int = Field(default=60_000, ge=1_000, le=600_000)
+    llm_max_retries: int = Field(default=2, ge=0, le=10)
+    # auto 首选 json_schema，仅在网关明确返回“不支持”时按接入能力缓存降级。
+    llm_structured_output_mode: Literal[
+        "auto", "json_schema", "json_object", "prompt_only"
+    ] = "auto"
+    # 部署方可显式锁定 LLM 接入配置；普通 SAG_LLM_* 仅作为首次启动默认值。
+    lock_llm_config: bool = False
+    # 透传给 chat/completions 的额外请求体（JSON），如 {"enable_thinking": false}；
+    # 未配置时对 qwen 系模型通过 LiteLLM reasoning_effort=none 统一关闭思考。
+    llm_extra_body: dict | None = None
+    llm_responses_provider: ResponsesProviderId = "openai"
+    llm_responses_endpoint: str = "https://api.openai.com/v1/responses"
+    llm_responses_api_version: str = ""
+    llm_responses_send_temperature: bool = False
+    llm_responses_thinking_config: str | None = None
+
+    # JEV is an independent scoring connection, enabled only by its search profile.
+    jev_endpoint: str | None = Field(default=None, max_length=1000)
+    jev_model: str = Field(default="jev-latest", min_length=1, max_length=200)
+    jev_api_key: str | None = Field(default=None, repr=False, max_length=8192)
+    jev_ranking_timeout_seconds: float = Field(default=30.0, ge=0.1, le=MAX_JEV_RANKING_TIMEOUT_SECONDS)
+    jev_failure_policy: Literal["error", "fallback_to_score"] = "error"
+
+    # Optional chatbot/query connections; extraction and indexing retain the original clients.
+    chatbot_llm_enabled: bool = False
+    chatbot_llm_provider: ModelProviderId = "openai"
+    chatbot_llm_base_url: str = ""
+    chatbot_llm_model: str = ""
+    chatbot_llm_api_key: str = Field(default="", repr=False)
+    chatbot_embedding_enabled: bool = False
+    chatbot_embedding_base_url: str = ""
+    chatbot_embedding_api_key: str = Field(default="", repr=False)
+    lock_chatbot_config: bool = False
+    chatbot_config_encryption_key: str = Field(default="", repr=False)
+    chatbot_llm_temperature: float | None = Field(default=None, ge=0, le=2)
+    chatbot_llm_max_tokens: int | None = Field(default=None, ge=1)
+    chatbot_llm_context_window: int | None = Field(default=None, ge=1)
+    chatbot_llm_timeout_ms: int | None = Field(default=None, ge=1_000, le=600_000)
+    chatbot_llm_max_retries: int | None = Field(default=None, ge=0, le=10)
+    chatbot_llm_structured_output_mode: str | None = None
+    chatbot_llm_extra_body: Annotated[dict | None, NoDecode] = None
+    chatbot_llm_responses_provider: ResponsesProviderId = "openai"
+    chatbot_llm_responses_endpoint: str = ""
+    chatbot_llm_responses_api_version: str = ""
+    chatbot_llm_responses_send_temperature: bool = False
+    chatbot_llm_responses_thinking_config: str | None = None
+
+    @model_validator(mode="after")
+    def validate_responses(self):
+        if self.llm_provider == "responses":
+            ResponsesConfig.from_settings(self)
+        return self
+
+    # ── Embedding（OpenAI-compatible；仅 OpenAI provider 可复用生成配置）───────
+    embedding_model: str = "Qwen/Qwen3-Embedding-4B"
+    embedding_base_url: str | None = "https://api.302ai.cn/v1"
+    embedding_api_key: str | None = None
+    # zleap-sag 0.13.0 起维度拆成两项独立语义（旧版共用一个 `dimensions` 字段）：
+    #   schema_dimensions  —— 向量库 schema 与返回向量校验（决定向量空间）
+    #   request_dimensions —— 请求体的 OpenAI `dimensions` 参数；None = 不发送
+    # `embedding_dimensions` 保留为兼容别名，同时喂给上面两项（见 effective_* 属性）。
+    embedding_dimensions: int | None = None
+    embedding_schema_dimensions: int | None = None
+    embedding_request_dimensions: int | None = None
+    # Per-engine embedding HTTP concurrency. llama.cpp --parallel 1 cannot
+    # absorb the zleap default of 8; queued batches hit the client timeout
+    # and the indexer rolls the whole document back.
+    embedding_concurrency: int = Field(default=8, ge=1, le=64)
+    embedding_timeout: int = Field(default=60, ge=5, le=600)
+
+    # ── 文档解析（进入 zleap-sag 前统一转为 Markdown）─────────────────
+    # auto：PDF 优先 MinerU，未配置或 MinerU 失败时回退本地 MarkItDown。
+    # anydoc：本地 AnyDoc 转换（不做 OCR），仅其不支持的文件回退 MarkItDown。
+    document_parser: Literal["auto", "markitdown", "mineru", "anydoc"] = "auto"
+    # self_hosted：自部署 MinerU 4.x V1 API（`mineru-kit api-server`），API Key 可留空。
+    mineru_provider: Literal["302", "official", "self_hosted"] = "302"
+    mineru_base_url: str | None = "https://api.302ai.cn"
+    mineru_api_key: str | None = None
+    mineru_version: Literal["2.0", "2.5"] = "2.5"
+    mineru_official_model: Literal["pipeline", "vlm"] = "vlm"
+    # 自部署 V1 解析档位；留空时使用服务端默认档位。
+    mineru_tier: Literal["flash", "basic", "standard", "advanced"] | None = None
+    # 仅对显式配置的自部署 Base URL 放行本机/内网地址；结果下载仍须与其同源。
+    mineru_allow_private_base_url: bool = False
+    mineru_parse_method: Literal["auto", "txt", "ocr"] = "auto"
+    mineru_request_timeout: float = 60.0
+    mineru_poll_interval: float = 2.0
+    mineru_poll_timeout: float = 300.0
+    mineru_result_max_mb: int = 100
+
+    # ── 检索默认 ────────────────────────────────────────────────────────
+    # multi_es_fast：默认策略。相关率平均比 vector 高 ~14 个百分点；
+    # vector store 不支持 lexical(pgvector/oceanbase) 时由 engine_manager 自动降级为 vector。
+    search_strategy: SearchStrategy = "multi_es_fast"
+    search_top_k: int = 8
+    # 全库检索先选有界信源候选；@ 显式范围同样受此硬上限保护。
+    search_source_candidate_limit: int = Field(default=16, ge=1, le=256)
+    search_source_concurrency: int = Field(default=4, ge=1, le=32)
+    # 中文连续查询默认进行查询侧分词；可关闭以回退到原有正则词项行为。
+    search_chinese_segmentation_enabled: bool = True
+    # 精确模式（multi）含查询侧 LLM 往返；超时/失败/空结果自动回退快速模式（vector）。
+    search_source_timeout: float = 12.0
+    search_fallback_vector: bool = True
+
+    # ── 检索评测 ────────────────────────────────────────────────────────
+    # LLM-as-judge 在评测端点/CLI 里默认开启；线上或不想烧 token 时可临时关闭。
+    eval_llm_judge_enabled: bool = True
+
+    # ── 知识宇宙 ──────────────────────────────────────────────────────────
+    # 服务端统一下发景深门与场景预算，前端不再散落硬编码阈值。
+    universe_manifest_source_limit: int = Field(default=256, ge=16, le=2048)
+    universe_timeline_event_page_size: int = Field(default=20, ge=10, le=50)
+    # 时间线只返回事件的一屏事实投影；完整邻域由显式探索分页加载。
+    universe_event_entity_limit: int = Field(default=8, ge=4, le=8)
+    universe_lod_orbit_px: int = Field(default=72, ge=24, le=240)
+    universe_lod_near_px: int = Field(default=180, ge=64, le=640)
+    universe_lod_deep_px: int = Field(default=360, ge=120, le=1200)
+    universe_lod_hysteresis_px: int = Field(default=24, ge=4, le=120)
+    universe_lod_debounce_ms: int = Field(default=220, ge=50, le=2000)
+    universe_proxy_budget_desktop: int = Field(default=15000, ge=256, le=16000)
+    universe_proxy_budget_mobile: int = Field(default=4000, ge=128, le=4800)
+    universe_node_budget_desktop: int = Field(default=700, ge=450, le=1200)
+    universe_node_budget_mobile: int = Field(default=520, ge=450, le=800)
+    universe_edge_budget_desktop: int = Field(default=1000, ge=600, le=1800)
+    universe_edge_budget_mobile: int = Field(default=720, ge=600, le=1200)
+    universe_planet_radius_min: float = Field(default=42.0, ge=12.0, le=160.0)
+    universe_planet_radius_max: float = Field(default=132.0, ge=48.0, le=360.0)
+    universe_planet_radius_scale: float = Field(default=22.0, ge=2.0, le=80.0)
+
+    # ── Agent 循环 ──────────────────────────────────────────────────────
+    agent_max_steps: int = 6  # 工具调用最大轮数（多轮检索的上界）
+    # 单个工具（含 search_context）执行上限；超时后 Agent 记 tool_timeout 并继续。
+    agent_tool_timeout_seconds: float = Field(default=30.0, ge=5, le=600)
+    history_keep_recent: int = 8  # 历史压缩时原文保留的最近消息数
+    # 只装载最近有界窗口；更旧对话应进入滚动摘要，不做全表回放。
+    history_load_limit: int = Field(default=200, ge=1, le=1000)
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, v: object) -> object:
+        """允许用逗号分隔的字符串配置 CORS 源。"""
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            if v.startswith("["):
+                return json.loads(v)
+            return [o.strip() for o in v.split(",") if o.strip()]
+        return v
+
+    @field_validator(
+        "embedding_dimensions",
+        "embedding_schema_dimensions",
+        "embedding_request_dimensions",
+        mode="before",
+    )
+    @classmethod
+    def _blank_embedding_dimensions_as_none(cls, value: object) -> object:
+        """compose 以 ${SAG_*_DIMENSIONS} 透传、变量未设置时注入空串，等价于未配置。"""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator(
+        "chatbot_llm_temperature", "chatbot_llm_max_tokens", "chatbot_llm_context_window",
+        "chatbot_llm_timeout_ms", "chatbot_llm_max_retries", "chatbot_llm_structured_output_mode",
+        "chatbot_llm_extra_body", mode="before",
+    )
+    @classmethod
+    def _blank_chatbot_tuning_as_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("chatbot_llm_extra_body", mode="before")
+    @classmethod
+    def _decode_chatbot_extra_body(cls, value: object) -> object:
+        if isinstance(value, str):
+            return json.loads(value) if value.strip() else None
+        return value
+
+    @field_validator("mineru_tier", mode="before")
+    @classmethod
+    def _blank_mineru_tier_as_default(cls, value: object) -> object:
+        # compose 透传未设置的 SAG_MINERU_TIER 时为空串，视为使用服务端默认档位。
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("search_strategy", mode="before")
+    @classmethod
+    def _normalize_legacy_search_strategy(cls, value: object) -> object:
+        # 兼容升级前的环境变量；公开 API 已不再接受 atomic。
+        return normalize_search_strategy(value) if isinstance(value, str) else value
+
+    @field_validator("jev_endpoint")
+    @classmethod
+    def _validate_jev_endpoint(cls, value: str | None) -> str | None:
+        return normalize_jev_endpoint(value)
+
+    @field_validator("jev_model")
+    @classmethod
+    def _validate_jev_model(cls, value: str) -> str:
+        model = value.strip()
+        if not model:
+            raise ValueError("JEV 模型名称不能为空")
+        return model
+
+    @field_validator("jev_api_key")
+    @classmethod
+    def _normalize_jev_api_key(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            ZoneInfo(normalized)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError("timezone 必须是有效的 IANA 时区") from error
+        return normalized
+
+    @field_validator("client_public_url", "client_web_url")
+    @classmethod
+    def _validate_client_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        return cls._validate_dsh_public_url(value)
+
+    @field_validator("dsh_public_url")
+    @classmethod
+    def _validate_dsh_public_url(cls, value: str) -> str:
+        """Normalize the trusted HTTP base used in the on-disk DSH descriptor."""
+        raw = value.strip()
+        parsed = urlsplit(raw)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("dsh_public_url 必须是绝对 HTTP(S) URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("dsh_public_url 不允许包含用户凭证")
+        if parsed.query or parsed.fragment:
+            raise ValueError("dsh_public_url 不允许包含 query 或 fragment")
+        path = parsed.path.rstrip("/")
+        if "//" in path:
+            raise ValueError("dsh_public_url 路径不允许包含连续斜杠")
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("dsh_public_url 端口无效") from error
+        hostname = parsed.hostname.lower()
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        authority = f"{host}:{port}" if port is not None else host
+        return urlunsplit((parsed.scheme.lower(), authority, path, "", ""))
+
+    @property
+    def effective_data_dir(self) -> str:
+        """当前进程实际使用的引擎目录；未切换时沿用配置值。"""
+        return self._active_data_dir or self.data_dir
+
+    def activate_data_dir(self, path: str | Path) -> None:
+        """记录存储引导选定的有效引擎目录，不改写持久配置。"""
+        self._active_data_dir = str(Path(path).expanduser().resolve())
+
+    @property
+    def llm_configured(self) -> bool:
+        """LLM 是否已配置（决定抽取 / 问答能否真正运行）。"""
+        return bool(self.llm_api_key)
+
+    @property
+    def routed_llm_model(self) -> str:
+        """统一调用链使用的 LiteLLM 路由名。"""
+        return get_model_provider(self.llm_provider).route_model(self.llm_model)
+
+    @property
+    def effective_llm_temperature(self) -> float:
+        """应用当前 provider 的采样能力约束。"""
+        return get_model_provider(self.llm_provider).resolve_temperature(self.llm_temperature)
+
+    @property
+    def effective_embedding_api_key(self) -> str | None:
+        provider = get_model_provider(self.llm_provider)
+        return self.embedding_api_key or (self.llm_api_key if provider.can_reuse_embedding_credentials else None)
+
+    @property
+    def effective_embedding_base_url(self) -> str | None:
+        provider = get_model_provider(self.llm_provider)
+        return self.embedding_base_url or (self.llm_base_url if provider.can_reuse_embedding_credentials else None)
+
+    @property
+    def effective_embedding_schema_dimensions(self) -> int:
+        """向量库 schema 与返回向量校验使用的维度。
+
+        未显式配置时沿用 1024：存量知识库的向量维度与之绑定，改默认会让旧向量对不上。
+        """
+        for value in (self.embedding_schema_dimensions, self.embedding_dimensions):
+            if value is not None:
+                return value
+        return _DEFAULT_EMBEDDING_DIMENSIONS
+
+    @property
+    def effective_embedding_request_dimensions(self) -> int | None:
+        """发往 OpenAI-compatible 请求体的 `dimensions` 参数；None 表示不发送。
+
+        未显式配置时跟随 schema 维度，逐字保留 0.12.0 的行为；只有已知拒绝该参数的
+        服务商/模型组合才省略（旧版由 engine_manager 在引擎初始化后绕过）。
+        """
+        for value in (self.embedding_request_dimensions, self.embedding_dimensions):
+            if value is not None:
+                return value
+        if _embedding_request_dimensions_unsupported(
+            self.effective_embedding_base_url, self.embedding_model
+        ):
+            return None
+        return self.effective_embedding_schema_dimensions
+
+    @property
+    def mineru_configured(self) -> bool:
+        """MinerU 是否具备可调用的端点与密钥（自部署服务可匿名访问）。"""
+        if self.mineru_provider == "self_hosted":
+            return bool(self.mineru_base_url)
+        return bool(self.mineru_base_url and self.mineru_api_key)
+
+    @property
+    def effective_document_parser(self) -> Literal["markitdown", "mineru", "anydoc"]:
+        """当前自动解析偏好；具体文件仍由解析服务按格式路由。
+
+        显式选择 AnyDoc 时直接返回 anydoc —— 本机解析不依赖 MinerU 配置，
+        不能被 `mineru_configured` 改写成 MinerU。其余模式保留原有规则：
+        非显式 MarkItDown 时按 MinerU 可用性选择 mineru / markitdown。
+        """
+        if self.document_parser == "anydoc":
+            return "anydoc"
+        if self.document_parser == "markitdown":
+            return "markitdown"
+        return "mineru" if self.mineru_configured else "markitdown"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()

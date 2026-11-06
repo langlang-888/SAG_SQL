@@ -1,0 +1,56 @@
+import { contextBridge, ipcRenderer } from "electron";
+
+import type { DesktopDiagnosticsInfo, UpdateState } from "./channels";
+
+// A sandboxed Electron preload only supports a limited require() surface and
+// cannot load local CommonJS modules. Keep these stable IPC names self-contained
+// so the bridge is available in packaged builds.
+const DESKTOP_CHANNELS = {
+  appInfo: "desktop:app-info",
+  checkForUpdates: "desktop:check-for-updates",
+  getUpdateState: "desktop:get-update-state",
+  downloadUpdate: "desktop:download-update",
+  installUpdate: "desktop:install-update",
+  diagnosticsInfo: "desktop:diagnostics-info",
+  updateState: "desktop:update-state",
+} as const;
+
+export interface SagDesktopBridge {
+  readonly isDesktop: true;
+  readonly platform: NodeJS.Platform;
+  readonly apiBase?: string;
+  appInfo(): Promise<{ version: string; platform: NodeJS.Platform; arch: string }>;
+  checkForUpdates(): Promise<{ supported: boolean }>;
+  getUpdateState(): Promise<UpdateState>;
+  downloadUpdate(version: string): Promise<{ started: boolean }>;
+  installUpdate(version: string): Promise<{ started: boolean }>;
+  getDiagnosticsInfo(): Promise<DesktopDiagnosticsInfo>;
+  onUpdateState(listener: (state: UpdateState) => void): () => void;
+}
+
+// Only the local window receives this argument from the main process.
+const apiPort = process.argv.find(value => /^--sag-api-port=\d+$/.test(value))?.split("=")[1];
+const port = Number(apiPort);
+
+const bridge: SagDesktopBridge = Object.freeze({
+  isDesktop: true,
+  platform: process.platform,
+  apiBase: Number.isInteger(port) && port > 0 && port <= 65535
+    ? `http://127.0.0.1:${port}` : undefined,
+  appInfo: () => ipcRenderer.invoke(DESKTOP_CHANNELS.appInfo),
+  checkForUpdates: () => ipcRenderer.invoke(DESKTOP_CHANNELS.checkForUpdates),
+  getUpdateState: () => ipcRenderer.invoke(DESKTOP_CHANNELS.getUpdateState),
+  downloadUpdate: (version: string) => ipcRenderer.invoke(DESKTOP_CHANNELS.downloadUpdate, version),
+  installUpdate: (version: string) => ipcRenderer.invoke(DESKTOP_CHANNELS.installUpdate, version),
+  getDiagnosticsInfo: () =>
+    ipcRenderer.invoke(DESKTOP_CHANNELS.diagnosticsInfo),
+  onUpdateState: (listener: (state: UpdateState) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: UpdateState) => {
+      listener(state);
+    };
+    ipcRenderer.on(DESKTOP_CHANNELS.updateState, handler);
+    return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.updateState, handler);
+  },
+});
+
+contextBridge.exposeInMainWorld("sagDesktop", bridge);
